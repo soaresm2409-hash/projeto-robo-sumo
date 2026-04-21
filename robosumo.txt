@@ -1,0 +1,210 @@
+/**
+ * @file Resenha_Movel_BLE.ino
+ * @author Seu Nome / Resenha Móvel
+ * @brief Controle de robô 4WD via Bluetooth Low Energy (ESP32 Core 3.x)
+ * @version 2.0
+ * @date 2026
+ * * Este código controla 4 motores DC via Ponte H, utilizando a nova API 
+ * de PWM (ledcAttach) do ESP32 e comunicação BLE para comandos remotos.
+ */
+
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+
+// =============================================================================
+// CONFIGURAÇÕES DE HARDWARE (PINAGEM)
+// =============================================================================
+// Definição dos pinos para as Pontes H
+const int motorPins[] = {25, 27, 12, 13, 26, 14, 32, 33};
+
+#define M1_IN1 25 
+#define M1_IN2 27
+#define M2_IN1 26 
+#define M2_IN2 14
+#define M3_IN1 12 
+#define M3_IN2 13
+#define M4_IN1 32 
+#define M4_IN2 33
+
+// Configurações de PWM para ESP32 Core 3.x
+const int PWM_FREQ = 5000;
+const int PWM_RES  = 8; // Resolução de 8 bits (0-255)
+
+// =============================================================================
+// CONFIGURAÇÕES BLE (UUIDs padrão Nordic UART)
+// =============================================================================
+#define SERVICE_UUID           "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
+#define CHARACTERISTIC_UUID_RX "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
+#define CHARACTERISTIC_UUID_TX "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
+
+// =============================================================================
+// VARIÁVEIS GLOBAIS
+// =============================================================================
+BLEServer* pServer = NULL;
+bool deviceConnected = false;
+int globalSpeed = 200; // Velocidade padrão inicial
+char lastCommand = 'P';
+
+// =============================================================================
+// FUNÇÕES DE CONTROLE DOS MOTORES
+// =============================================================================
+
+/**
+ * Controla a direção e velocidade de um motor específico
+ * @param in1 Pino 1 da Ponte H
+ * @param in2 Pino 2 da Ponte H
+ * @param dir 1: Frente, -1: Ré, 0: Parar
+ */
+void setMotor(int in1, int in2, int dir) {
+  if (dir == 1) {
+    ledcWrite(in1, globalSpeed);
+    ledcWrite(in2, 0);
+  } else if (dir == -1) {
+    ledcWrite(in1, 0);
+    ledcWrite(in2, globalSpeed);
+  } else {
+    ledcWrite(in1, 0);
+    ledcWrite(in2, 0);
+  }
+}
+
+void pararTudo() {
+  for (int i = 0; i < 8; i++) {
+    ledcWrite(motorPins[i], 0);
+  }
+  Serial.println(">>> MOTORES PARADOS");
+}
+
+void executarMovimento(char cmd) {
+  switch (toupper(cmd)) {
+    case 'F': // Frente
+      setMotor(M1_IN1, M1_IN2, 1);  setMotor(M2_IN1, M2_IN2, 1);
+      setMotor(M3_IN1, M3_IN2, 1);  setMotor(M4_IN1, M4_IN2, 1);
+      Serial.println("Movimento: FRENTE");
+      break;
+    case 'B': // Ré
+      setMotor(M1_IN1, M1_IN2, -1); setMotor(M2_IN1, M2_IN2, -1);
+      setMotor(M3_IN1, M3_IN2, -1); setMotor(M4_IN1, M4_IN2, -1);
+      Serial.println("Movimento: RÉ");
+      break;
+    case 'L': // Esquerda
+      setMotor(M1_IN1, M1_IN2, -1); setMotor(M2_IN1, M2_IN2, 1);
+      setMotor(M3_IN1, M3_IN2, -1); setMotor(M4_IN1, M4_IN2, 1);
+      Serial.println("Movimento: ESQUERDA");
+      break;
+    case 'R': // Direita
+      setMotor(M1_IN1, M1_IN2, 1);  setMotor(M2_IN1, M2_IN2, -1);
+      setMotor(M3_IN1, M3_IN2, 1);  setMotor(M4_IN1, M4_IN2, -1);
+      Serial.println("Movimento: DIREITA");
+      break;
+    default:
+      pararTudo();
+      break;
+  }
+}
+
+// =============================================================================
+// CALLBACKS DO SERVIDOR BLE
+// =============================================================================
+
+class MyServerCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer* pServer) {
+    deviceConnected = true;
+    Serial.println(">>> Smartphone Conectado!");
+  }
+
+  void onDisconnect(BLEServer* pServer) {
+    deviceConnected = false;
+    pararTudo(); // Segurança: para o robô se perder o sinal
+    lastCommand = 'P';
+    Serial.println(">>> Smartphone Desconectado! Aguardando nova conexão...");
+    pServer->getAdvertising()->start(); // Reinicia visibilidade
+  }
+};
+
+class MyCallbacks : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic* pCharacteristic) {
+    std::string value = pCharacteristic->getValue();
+    if (value.length() > 0) {
+      String cmd = String(value.c_str());
+      cmd.trim();
+      char firstChar = toupper(cmd[0]);
+
+      // Lógica de Ajuste de Velocidade (Ex: S180, S+, S-)
+      if (firstChar == 'S') {
+        if (cmd.substring(1) == "+") {
+          globalSpeed = min(255, globalSpeed + 25);
+        } else if (cmd.substring(1) == "-") {
+          globalSpeed = max(0, globalSpeed - 25);
+        } else {
+          int s = cmd.substring(1).toInt();
+          if (s >= 0 && s <= 255) globalSpeed = s;
+        }
+        Serial.printf("Nova Velocidade: %d\n", globalSpeed);
+        
+        // Atualiza o movimento atual com a nova velocidade
+        if (lastCommand != 'P') executarMovimento(lastCommand);
+      } 
+      // Lógica de Direção
+      else {
+        lastCommand = firstChar;
+        executarMovimento(lastCommand);
+      }
+    }
+  }
+};
+
+// =============================================================================
+// SETUP E LOOP PRINCIPAL
+// =============================================================================
+
+void setup() {
+  Serial.begin(115200);
+
+  // Configuração dos Pinos e PWM
+  for (int pin : motorPins) {
+    pinMode(pin, OUTPUT);
+    ledcAttach(pin, PWM_FREQ, PWM_RES);
+    ledcWrite(pin, 0); // Garante que começa parado
+  }
+
+  // Inicialização do dispositivo BLE
+  BLEDevice::init("Resenha_Movel_V2");
+  pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new MyServerCallbacks());
+
+  // Criação do Serviço UART
+  BLEService* pService = pServer->createService(SERVICE_UUID);
+
+  // Característica para Notificação (TX)
+  BLECharacteristic* pTxCharacteristic = pService->createCharacteristic(
+    CHARACTERISTIC_UUID_TX,
+    BLECharacteristic::PROPERTY_NOTIFY
+  );
+  pTxCharacteristic->addDescriptor(new BLE2902());
+
+  // Característica para Recebimento (RX)
+  BLECharacteristic* pRxCharacteristic = pService->createCharacteristic(
+    CHARACTERISTIC_UUID_RX,
+    BLECharacteristic::PROPERTY_WRITE
+  );
+  pRxCharacteristic->setCallbacks(new MyCallbacks());
+
+  // Inicia o serviço e começa a anunciar
+  pService->start();
+  pServer->getAdvertising()->start();
+
+  Serial.println("======================================");
+  Serial.println("   RESENHA MÓVEL - BLE INICIADO");
+  Serial.println("   Aguardando conexão...");
+  Serial.println("   Comandos: F, B, L, R, P, S+, S-");
+  Serial.println("======================================");
+}
+
+void loop() {
+  // O processamento ocorre via interrupções (callbacks) do BLE.
+  // O loop fica livre para expansões futuras (sensores ultrassônicos, etc).
+  delay(20);
+}
